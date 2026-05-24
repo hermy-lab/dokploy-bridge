@@ -71,14 +71,16 @@ const sendJson = (res: ServerResponse, status: number, body: unknown) => {
   res.end(JSON.stringify(body, null, 2));
 };
 
-const requireAuth = (req: IncomingMessage) => {
+const requireAuth = (req: IncomingMessage): Effect.Effect<void, HttpError> => {
   const auth = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
-  if (token !== config.bridgeToken) throw new HttpError(401, "Unauthorized");
+  if (token !== config.bridgeToken) return Effect.fail(new HttpError(401, "Unauthorized"));
+  return Effect.void;
 };
 
-const assertAllowedApp = (appId: string) => {
-  if (!config.allowedAppIds.has(appId)) throw new HttpError(403, "App is not allowlisted");
+const assertAllowedApp = (appId: string): Effect.Effect<void, HttpError> => {
+  if (!config.allowedAppIds.has(appId)) return Effect.fail(new HttpError(403, "App is not allowlisted"));
+  return Effect.void;
 };
 
 const dokploy = <T>(method: "GET" | "POST", path: string, body?: unknown): Effect.Effect<T, HttpError> =>
@@ -125,38 +127,46 @@ const routeAuthed = (req: IncomingMessage): Effect.Effect<unknown, HttpError> =>
 
   const appStatusId = appIdFromPath(url.pathname, "");
   if (req.method === "GET" && appStatusId) {
-    assertAllowedApp(appStatusId);
-    return dokploy("GET", `/application.one?applicationId=${encodeURIComponent(appStatusId)}`);
+    return pipe(
+      assertAllowedApp(appStatusId),
+      Effect.flatMap(() => dokploy("GET", `/application.one?applicationId=${encodeURIComponent(appStatusId)}`))
+    );
   }
 
   const appRedeployId = appIdFromPath(url.pathname, "/redeploy");
   if (req.method === "POST" && appRedeployId) {
-    if (!config.allowRedeploy) throw new HttpError(403, "Redeploy is disabled");
-    assertAllowedApp(appRedeployId);
-    return dokploy("POST", "/application.redeploy", {
-      applicationId: appRedeployId,
-      title: "Redeploy requested by Hermes bridge",
-      description: "Restricted redeploy via dokploy-bridge",
-    });
+    if (!config.allowRedeploy) return Effect.fail(new HttpError(403, "Redeploy is disabled"));
+    return pipe(
+      assertAllowedApp(appRedeployId),
+      Effect.flatMap(() => dokploy("POST", "/application.redeploy", {
+        applicationId: appRedeployId,
+        title: "Redeploy requested by Hermes bridge",
+        description: "Restricted redeploy via dokploy-bridge",
+      }))
+    );
   }
 
   const appStartId = appIdFromPath(url.pathname, "/start");
   if (req.method === "POST" && appStartId) {
-    if (!config.allowStartStop) throw new HttpError(403, "Start/stop is disabled");
-    assertAllowedApp(appStartId);
-    return dokploy("POST", "/application.start", { applicationId: appStartId });
+    if (!config.allowStartStop) return Effect.fail(new HttpError(403, "Start/stop is disabled"));
+    return pipe(
+      assertAllowedApp(appStartId),
+      Effect.flatMap(() => dokploy("POST", "/application.start", { applicationId: appStartId }))
+    );
   }
 
   const appStopId = appIdFromPath(url.pathname, "/stop");
   if (req.method === "POST" && appStopId) {
-    if (!config.allowStartStop) throw new HttpError(403, "Start/stop is disabled");
-    assertAllowedApp(appStopId);
-    return dokploy("POST", "/application.stop", { applicationId: appStopId });
+    if (!config.allowStartStop) return Effect.fail(new HttpError(403, "Start/stop is disabled"));
+    return pipe(
+      assertAllowedApp(appStopId),
+      Effect.flatMap(() => dokploy("POST", "/application.stop", { applicationId: appStopId }))
+    );
   }
 
   if (req.method === "POST" && url.pathname === "/apps") {
-    if (!config.allowCreate) throw new HttpError(403, "Create app is disabled");
-    if (!config.allowedEnvironmentId) throw new HttpError(500, "ALLOWED_ENVIRONMENT_ID is required for app creation");
+    if (!config.allowCreate) return Effect.fail(new HttpError(403, "Create app is disabled"));
+    if (!config.allowedEnvironmentId) return Effect.fail(new HttpError(500, "ALLOWED_ENVIRONMENT_ID is required for app creation"));
 
     return pipe(
       readJson(req),
@@ -180,17 +190,23 @@ const routeAuthed = (req: IncomingMessage): Effect.Effect<unknown, HttpError> =>
 };
 
 const route = (req: IncomingMessage): Effect.Effect<unknown, HttpError> =>
-  Effect.try({
-    try: () => requireAuth(req),
-    catch: (error) => error instanceof HttpError ? error : new HttpError(500, "Auth check failed", error),
-  }).pipe(Effect.flatMap(() => routeAuthed(req)));
+  pipe(
+    requireAuth(req),
+    Effect.flatMap(() => routeAuthed(req))
+  );
 
 const server = createServer((req, res) => {
-  Effect.runPromise(route(req)).then(
-    (body) => sendJson(res, 200, body),
+  Effect.runPromise(Effect.either(route(req))).then(
+    (result) => {
+      if (result._tag === "Left") {
+        const err = result.left;
+        sendJson(res, err.status, { error: err.message, details: err.details ?? undefined });
+        return;
+      }
+      sendJson(res, 200, result.right);
+    },
     (error) => {
-      const err = error instanceof HttpError ? error : new HttpError(500, "Internal error", String(error));
-      sendJson(res, err.status, { error: err.message, details: err.details ?? undefined });
+      sendJson(res, 500, { error: "Internal error", details: String(error) });
     }
   );
 });

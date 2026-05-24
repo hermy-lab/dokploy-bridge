@@ -25,10 +25,17 @@ Disabled by default:
 - create apps
 - start/stop apps
 - delete anything
-- update app config
+- broad app updates
 - edit env vars/secrets
-- edit domains/Traefik
+- edit arbitrary domains/Traefik
 - access Docker/SSH keys/git providers
+
+Optional constrained configuration endpoints:
+
+- `POST /apps/:id/github` only for allowlisted GitHub owner/repositories
+- `POST /apps/:id/build-type` only for managed apps
+- `POST /apps/:id/domains` only for allowlisted domain suffixes
+- `POST /apps/:id/deploy` for managed apps when redeploy is enabled
 
 ## Setup
 
@@ -54,6 +61,11 @@ ALLOWED_APP_IDS=app_id_1,app_id_2
 ALLOW_REDEPLOY=true
 ALLOW_CREATE=false
 ALLOW_START_STOP=false
+
+# optional constrained configuration
+ALLOWED_GITHUB_OWNER=hermy-lab
+ALLOWED_REPO_NAMES=working-hours-app
+ALLOWED_DOMAIN_SUFFIXES=.saphi.app
 ```
 
 ## API

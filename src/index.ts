@@ -19,6 +19,9 @@ type Config = {
   allowCreate: boolean;
   allowStartStop: boolean;
   allowRedeploy: boolean;
+  allowedGithubOwner: string | undefined;
+  allowedRepoNames: Set<string>;
+  allowedDomainSuffixes: string[];
 };
 
 const splitCsv = (value = "") =>
@@ -46,6 +49,9 @@ const loadConfig = (): Config => {
     allowCreate: bool(process.env.ALLOW_CREATE, false),
     allowStartStop: bool(process.env.ALLOW_START_STOP, false),
     allowRedeploy: bool(process.env.ALLOW_REDEPLOY, true),
+    allowedGithubOwner: process.env.ALLOWED_GITHUB_OWNER || undefined,
+    allowedRepoNames: new Set(splitCsv(process.env.ALLOWED_REPO_NAMES)),
+    allowedDomainSuffixes: splitCsv(process.env.ALLOWED_DOMAIN_SUFFIXES),
   };
 };
 
@@ -82,6 +88,56 @@ const assertAllowedApp = (appId: string): Effect.Effect<void, HttpError> => {
   if (!config.allowedAppIds.has(appId)) return Effect.fail(new HttpError(403, "App is not allowlisted"));
   return Effect.void;
 };
+
+type DokployApplication = {
+  applicationId: string;
+  name?: string | null;
+  appName?: string | null;
+  environmentId?: string | null;
+};
+
+const getApplication = (appId: string) =>
+  dokploy<DokployApplication>("GET", `/application.one?applicationId=${encodeURIComponent(appId)}`);
+
+const assertAllowedManagedApp = (appId: string): Effect.Effect<DokployApplication, HttpError> => {
+  if (config.allowedAppIds.has(appId)) return getApplication(appId);
+  if (!config.allowedEnvironmentId) return Effect.fail(new HttpError(403, "App is not allowlisted"));
+
+  return pipe(
+    getApplication(appId),
+    Effect.flatMap((app) => app.environmentId === config.allowedEnvironmentId
+      ? Effect.succeed(app)
+      : Effect.fail(new HttpError(403, "App is outside the allowed environment")))
+  );
+};
+
+const assertAllowedGithubSource = (owner: string, repository: string): Effect.Effect<void, HttpError> => {
+  if (config.allowedGithubOwner && owner !== config.allowedGithubOwner) {
+    return Effect.fail(new HttpError(403, "GitHub owner is not allowlisted"));
+  }
+  if (config.allowedRepoNames.size > 0 && !config.allowedRepoNames.has(repository)) {
+    return Effect.fail(new HttpError(403, "GitHub repository is not allowlisted"));
+  }
+  if (!/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repository)) {
+    return Effect.fail(new HttpError(400, "Invalid GitHub owner or repository"));
+  }
+  return Effect.void;
+};
+
+const assertAllowedDomain = (host: string): Effect.Effect<void, HttpError> => {
+  const normalized = host.toLowerCase();
+  if (!/^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(normalized)) {
+    return Effect.fail(new HttpError(400, "Invalid domain host"));
+  }
+  if (config.allowedDomainSuffixes.length === 0) {
+    return Effect.fail(new HttpError(403, "Domain creation is disabled"));
+  }
+  if (!config.allowedDomainSuffixes.some((suffix) => normalized.endsWith(suffix.toLowerCase()))) {
+    return Effect.fail(new HttpError(403, "Domain suffix is not allowlisted"));
+  }
+  return Effect.void;
+};
+
 
 const dokploy = <T>(method: "GET" | "POST", path: string, body?: unknown): Effect.Effect<T, HttpError> =>
   Effect.tryPromise({
@@ -129,7 +185,7 @@ const routeAuthed = (req: IncomingMessage): Effect.Effect<unknown, HttpError> =>
   if (req.method === "GET" && appStatusId) {
     return pipe(
       assertAllowedApp(appStatusId),
-      Effect.flatMap(() => dokploy("GET", `/application.one?applicationId=${encodeURIComponent(appStatusId)}`))
+      Effect.flatMap(() => getApplication(appStatusId))
     );
   }
 
@@ -137,12 +193,116 @@ const routeAuthed = (req: IncomingMessage): Effect.Effect<unknown, HttpError> =>
   if (req.method === "POST" && appRedeployId) {
     if (!config.allowRedeploy) return Effect.fail(new HttpError(403, "Redeploy is disabled"));
     return pipe(
-      assertAllowedApp(appRedeployId),
+      assertAllowedManagedApp(appRedeployId),
       Effect.flatMap(() => dokploy("POST", "/application.redeploy", {
         applicationId: appRedeployId,
         title: "Redeploy requested by Hermes bridge",
         description: "Restricted redeploy via dokploy-bridge",
       }))
+    );
+  }
+
+
+  const appDeployId = appIdFromPath(url.pathname, "/deploy");
+  if (req.method === "POST" && appDeployId) {
+    if (!config.allowRedeploy) return Effect.fail(new HttpError(403, "Deploy is disabled"));
+    return pipe(
+      assertAllowedManagedApp(appDeployId),
+      Effect.flatMap(() => dokploy("POST", "/application.deploy", {
+        applicationId: appDeployId,
+        title: "Deploy requested by Hermes bridge",
+        description: "Restricted deploy via dokploy-bridge",
+      }))
+    );
+  }
+
+  const appGithubId = appIdFromPath(url.pathname, "/github");
+  if (req.method === "POST" && appGithubId) {
+    return pipe(
+      assertAllowedManagedApp(appGithubId),
+      Effect.flatMap(() => readJson(req)),
+      Effect.flatMap((body) => {
+        const input = body as { owner?: unknown; repository?: unknown; branch?: unknown; buildPath?: unknown; githubId?: unknown };
+        if (typeof input.owner !== "string" || typeof input.repository !== "string") {
+          return Effect.fail(new HttpError(400, "owner and repository are required"));
+        }
+        const branch = typeof input.branch === "string" ? input.branch : "main";
+        const buildPath = typeof input.buildPath === "string" ? input.buildPath : "/";
+        const githubId = typeof input.githubId === "string" ? input.githubId : null;
+        return pipe(
+          assertAllowedGithubSource(input.owner, input.repository),
+          Effect.flatMap(() => dokploy("POST", "/application.saveGithubProvider", {
+            applicationId: appGithubId,
+            owner: input.owner,
+            repository: input.repository,
+            branch,
+            buildPath,
+            githubId,
+            triggerType: "push",
+            enableSubmodules: false,
+            watchPaths: null,
+          }))
+        );
+      })
+    );
+  }
+
+  const appBuildTypeId = appIdFromPath(url.pathname, "/build-type");
+  if (req.method === "POST" && appBuildTypeId) {
+    return pipe(
+      assertAllowedManagedApp(appBuildTypeId),
+      Effect.flatMap(() => readJson(req)),
+      Effect.flatMap((body) => {
+        const input = body as { buildType?: unknown; publishDirectory?: unknown; isStaticSpa?: unknown };
+        const buildType = typeof input.buildType === "string" ? input.buildType : "nixpacks";
+        if (!["dockerfile", "heroku_buildpacks", "paketo_buildpacks", "nixpacks", "static", "railpack"].includes(buildType)) {
+          return Effect.fail(new HttpError(400, "Unsupported buildType"));
+        }
+        return dokploy("POST", "/application.saveBuildType", {
+          applicationId: appBuildTypeId,
+          buildType,
+          dockerfile: "Dockerfile",
+          dockerContextPath: null,
+          dockerBuildStage: null,
+          herokuVersion: null,
+          railpackVersion: null,
+          publishDirectory: typeof input.publishDirectory === "string" ? input.publishDirectory : null,
+          isStaticSpa: typeof input.isStaticSpa === "boolean" ? input.isStaticSpa : null,
+        });
+      })
+    );
+  }
+
+  const appDomainId = appIdFromPath(url.pathname, "/domains");
+  if (req.method === "POST" && appDomainId) {
+    return pipe(
+      assertAllowedManagedApp(appDomainId),
+      Effect.flatMap(() => readJson(req)),
+      Effect.flatMap((body) => {
+        const input = body as { host?: unknown; port?: unknown; https?: unknown };
+        if (typeof input.host !== "string") return Effect.fail(new HttpError(400, "host is required"));
+        const host = input.host;
+        const port = typeof input.port === "number" ? input.port : 3000;
+        const https = typeof input.https === "boolean" ? input.https : true;
+        return pipe(
+          assertAllowedDomain(host),
+          Effect.flatMap(() => dokploy("POST", "/domain.create", {
+            host: host.toLowerCase(),
+            path: "/",
+            port,
+            https,
+            applicationId: appDomainId,
+            certificateType: https ? "letsencrypt" : "none",
+            customCertResolver: null,
+            composeId: null,
+            serviceName: null,
+            domainType: "application",
+            previewDeploymentId: null,
+            internalPath: null,
+            stripPath: false,
+          }))
+        );
+      })
     );
   }
 

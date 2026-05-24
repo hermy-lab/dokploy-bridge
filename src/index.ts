@@ -108,8 +108,7 @@ const appIdFromPath = (pathname: string, suffix: string) => {
   return match?.[1];
 };
 
-const route = (req: IncomingMessage): Effect.Effect<unknown, HttpError> => {
-  requireAuth(req);
+const routeAuthed = (req: IncomingMessage): Effect.Effect<unknown, HttpError> => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
   if (req.method === "GET" && url.pathname === "/health") {
@@ -179,6 +178,12 @@ const route = (req: IncomingMessage): Effect.Effect<unknown, HttpError> => {
 
   return Effect.fail(new HttpError(404, "Not found or intentionally blocked"));
 };
+
+const route = (req: IncomingMessage): Effect.Effect<unknown, HttpError> =>
+  Effect.try({
+    try: () => requireAuth(req),
+    catch: (error) => error instanceof HttpError ? error : new HttpError(500, "Auth check failed", error),
+  }).pipe(Effect.flatMap(() => routeAuthed(req)));
 
 const server = createServer((req, res) => {
   Effect.runPromise(route(req)).then(
